@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# Команда настройки доставки Ozon для Tilda. Ставится в /usr/local/bin/ozon-tilda (deploy/install.sh).
+#   ozon-tilda setup   — мастер: вопросы здесь и подсказки, что сделать в Tilda; повторно — показывает,
+#                        что настроено, и даёт выбрать шаги (ozon-tilda setup 8 9 — сразу только эти)
+#   ozon-tilda show    — текущие настройки, код для Tilda
+#   ozon-tilda check   — проверить ключи и сделать пробный расчёт
+#   ozon-tilda logs    — вебхуки от Tilda и заказы в Ozon; logs <номер> — что пришло от Tilda
+#   ozon-tilda restart — перезапустить сервис
+#   ozon-tilda update  — скачать новую версию с GitHub и пересобрать (настройки и база сохраняются)
+# Шаги 1 и 5 (адрес сервера и ключи Ozon) живут здесь: они пишут .env и перезапускают контейнеры.
+# Остальные шаги — server/src/cli/setup.ts внутри контейнера.
+set -euo pipefail
+DIR=/opt/ozon-tilda
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+cd "$DIR"
+ENVF=.env
+LINE='────────────────────────────────────────────────────'
+
+section() { local t="$1"; echo; echo "── $t ${LINE:0:$((52 - ${#t} - 4))}"; }
+envget() { grep -E "^$1=" "$ENVF" | head -1 | cut -d= -f2- || true; }
+envset() {
+  local tmp; tmp=$(mktemp)
+  grep -v -E "^$1=" "$ENVF" > "$tmp" || true
+  printf '%s=%s\n' "$1" "$2" >> "$tmp"
+  cat "$tmp" > "$ENVF"; rm -f "$tmp"; chmod 600 "$ENVF"
+}
+mask_phone() { local p="$1"; [ -n "$p" ] && echo "${p:0:5}***${p: -4}" || true; }
+
+wait_health() {
+  for _ in $(seq 1 30); do
+    docker exec ozon-tilda-app wget -qO- http://127.0.0.1:3000/ozon-tilda/health >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  echo "  ✕ Сервис не запустился — посмотрите: docker logs ozon-tilda-app --tail 50"
+  return 1
+}
+
+restart_app() {
+  docker compose up -d app >/dev/null 2>&1
+  wait_health
+}
+
+server_ip() {
+  curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}'
+}
+
+# —— 1. Адрес сервера ——
+step_domain() {
+  section "1. Адрес этого сервера"
+  local ip cur d resolved choice
+  ip=$(server_ip)
+  cur=$(envget DOMAIN)
+  echo "Поддомен, на котором будет работать доставка, например delivery.shop.ru."
+  echo "Сначала в DNS домена создайте A-запись: поддомен → $ip"
+  echo
+  while :; do
+    read -r -p "  Адрес${cur:+ [$cur]}: " d
+    d=${d:-$cur}
+    d=$(echo "$d" | tr 'A-Z' 'a-z' | sed -E 's#^https?://##; s#/.*$##; s#:.*$##')
+    if [ -z "$d" ]; then echo "    ✕ Нужен адрес, например delivery.shop.ru"; continue; fi
+    if ! [[ "$d" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+([a-z]{2,}|xn--[a-z0-9-]+)$ ]]; then
+      echo "    ✕ Не похоже на адрес, пример: delivery.shop.ru (русский домен — в виде xn--…)"; continue
+    fi
+    break
+  done
+
+  while :; do
+    printf '  Проверяю DNS… '
+    resolved=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)
+    if [[ " $resolved " == *" $ip "* ]]; then
+      echo "✓ $d указывает на этот сервер"
+      break
+    fi
+    echo "✕ $d ${resolved:+пока указывает на ${resolved% }}${resolved:-пока не найден в DNS}, а нужно на $ip"
+    echo "    DNS обновляется от нескольких минут до пары часов."
+    echo "    1) проверить ещё раз   2) продолжить без HTTPS, доделать позже"
+    read -r -p "  Выбор [1]: " choice
+    if [ "${choice:-1}" = "2" ]; then
+      envset DOMAIN "$d"
+      envset PUBLIC_URL "http://$d/ozon-tilda"
+      restart_app
+      return
+    fi
+  done
+
+  envset DOMAIN "$d"
+  envset PUBLIC_URL "https://$d/ozon-tilda"
+  printf '  Получаю HTTPS-сертификат… '
+  docker compose --profile https up -d >/dev/null 2>&1
+  wait_health >/dev/null || true
+  for _ in $(seq 1 30); do
+    # Через 127.0.0.1: у облачных серверов (Cloud.ru) запрос на свой же внешний IP изнутри не доходит.
+    # Сертификат при этом проверяется по-настоящему — по имени $d.
+    if curl -sf --max-time 5 --resolve "$d:443:127.0.0.1" "https://$d/ozon-tilda/health" >/dev/null 2>&1; then echo "✓ готово"; return; fi
+    sleep 3
+  done
+  echo "✕ пока не получилось"
+  echo "    Скорее всего, хостинг не пропускает к серверу порты 80 и 443 — без них не выпустить"
+  echo "    HTTPS-сертификат, и Tilda не достучится до сервера."
+  echo "    Что сделать: в панели хостинга у этого сервера откройте входящие порты 80 и 443"
+  echo "    (TCP, источник — любой, 0.0.0.0/0). Обычно это раздел «Группы безопасности»"
+  echo "    (Security groups) или «Фаервол» у виртуальной машины: добавьте два правила для входящего трафика."
+  echo "    Потом запустите ozon-tilda setup ещё раз — остальные настройки сохранятся, жмите Enter."
+  echo "    Подробности для разработчика: docker logs ozon-tilda-caddy --tail 30"
+}
+
+# —— 2. Ключи Ozon ——
+normalize_phone() {
+  local d; d=$(echo "$1" | tr -cd '0-9')
+  if [ ${#d} -eq 11 ] && { [ "${d:0:1}" = 7 ] || [ "${d:0:1}" = 8 ]; }; then d=${d:1}; fi
+  if [ ${#d} -eq 10 ] && [ "${d:0:1}" = 9 ]; then echo "+7$d"; fi
+}
+
+step_keys() {
+  section "5. Ключи Ozon Доставки"
+  cat <<'TXT'
+  С ключами цена считается по договору вашего магазина, корзина проверяет, что у покупателя
+  есть аккаунт Ozon, а заказы создаются отправлениями в вашем кабинете.
+
+  1) Зарегистрируйтесь в Ozon Доставке для бизнеса: dostavka.ozon.ru → «Для бизнеса» →
+     «Подключить». Нужен именно этот кабинет, не кабинет продавца seller.ozon.ru.
+     Примите оферту в кабинете и дождитесь одобрения (обычно 10–15 минут).
+  2) В кабинете: API интеграции → Управление частными приложениями → «Создать».
+  3) Отметьте «Все методы Delivery API» и нажмите «Создать».
+  4) В строке приложения нажмите значок ключа и скопируйте Client ID и Client Secret.
+
+TXT
+  local cid scur pcur id secret phone p changed=0
+  cid=$(envget OZON_DELIVERY_CLIENT_ID)
+  scur=$(envget OZON_DELIVERY_CLIENT_SECRET)
+  pcur=$(envget OZON_SERVICE_PHONE)
+
+  while :; do
+    read -r -p "  Client ID${cid:+ [$cid]}${cid:- (Enter — пропустить, тестовый режим)}: " id
+    id=${id:-$cid}
+    if [ -z "$id" ]; then
+      echo "    ✓ принято: без ключей — тестовый режим, цены условные"
+      envset OZON_MODE mock
+      restart_app
+      return
+    fi
+    if [[ "$id" =~ ^[A-Za-z0-9_.-]{8,200}$ ]]; then break; fi
+    echo "    ✕ Вставьте Client ID из Ozon Доставки целиком"
+  done
+  while :; do
+    read -r -s -p "  Client Secret (ввод скрыт)${scur:+ [сохранён]}: " secret; echo
+    secret=${secret:-$scur}
+    if [[ "$secret" =~ ^[^[:space:]]{8,500}$ ]]; then break; fi
+    echo "    ✕ Вставьте Client Secret из Ozon Доставки целиком"
+  done
+  while :; do
+    read -r -p "  Телефон с аккаунтом Ozon, +79XXXXXXXXX${pcur:+ [$(mask_phone "$pcur")]}: " p
+    if [ -z "$p" ] && [ -n "$pcur" ]; then phone=$pcur; break; fi
+    phone=$(normalize_phone "$p")
+    if [ -n "$phone" ]; then break; fi
+    echo "    ✕ Российский мобильный, например +7 999 123-45-67"
+  done
+  echo "    ↳ без него Ozon не считает цену доставки"
+
+  [ "$id" != "$cid" ] && changed=1
+  [ "$secret" != "$scur" ] && changed=1
+  [ "$phone" != "$pcur" ] && changed=1
+  [ "$(envget OZON_MODE)" != live ] && changed=1
+  if [ $changed = 1 ]; then
+    envset OZON_DELIVERY_CLIENT_ID "$id"
+    envset OZON_DELIVERY_CLIENT_SECRET "$secret"
+    envset OZON_SERVICE_PHONE "$phone"
+    envset OZON_MODE live
+    restart_app
+  fi
+  echo "    ✓ принято: Client ID $id, телефон $(mask_phone "$phone")"
+}
+
+app_cli() {
+  local t=-i; [ -t 0 ] && t=-it
+  docker exec "$t" ozon-tilda-app node server/dist/cli/setup.js "$@"
+}
+
+# Какие шаги пройти: аргументы (ozon-tilda setup 5 6) или выбор в меню; пусто — все.
+PARTIAL=""
+FIRST=1
+pick_steps() {
+  local pick n
+  if [ $# -gt 0 ]; then pick="$*"
+  elif [ -z "$(envget DOMAIN)" ]; then   # первый запуск — все шаги по порядку
+    pick=""
+    cat <<'TXT'
+
+Как это работает: покупатель выбирает в корзине Tilda доставку «Озон», виджет показывает
+пункты выдачи и цену от Ozon. После заказа Tilda присылает его на этот сервер, и он создаёт
+отправление в вашем кабинете Ozon Доставки.
+
+Мастер проведёт по всей настройке, около 20 минут. Часть шагов — ответы здесь, часть —
+действия в Tilda: терминал подскажет, что нажать, и подождёт. Держите открытыми Tilda
+и кабинет Ozon Доставки.
+TXT
+  else
+    echo
+    # Без -i: иначе docker exec заберёт ответы, поданные заранее (printf … | ozon-tilda setup).
+    docker exec ozon-tilda-app node server/dist/cli/setup.js summary
+    FIRST=$(docker exec ozon-tilda-app node server/dist/cli/setup.js next 2>/dev/null || echo 1)
+    [[ "$FIRST" =~ ^([1-9]|10)$ ]] || FIRST=1
+    echo
+    if [ "$FIRST" -gt 1 ]; then
+      echo "  Enter — продолжить с шага $FIRST и дальше по порядку (сделанные шаги не спрашиваю)"
+    else
+      echo "  Enter — пройти все шаги по порядку (Enter в вопросе оставляет значение)"
+    fi
+    echo "  Номера через пробел — пройти только эти шаги, например: 8 9"
+    echo "  0 — ничего не менять, только проверить"
+    while :; do
+      read -r -p "  Какие шаги? [$([ "$FIRST" -gt 1 ] && echo "$FIRST–10" || echo все)]: " pick
+      pick=$(echo "$pick" | tr ',' ' ')
+      local ok=1
+      for n in $pick; do [[ "$n" =~ ^([0-9]|10)$ ]] || ok=0; done
+      [ $ok = 1 ] && break
+      echo "    ✕ Номера шагов от 1 до 10 через пробел, или 0"
+    done
+  fi
+  if [ -z "${pick// /}" ]; then pick=$(seq -s ' ' "${FIRST:-1}" 10)
+  else PARTIAL=--auto; fi
+  [[ " $pick " == *" 0 "* ]] && pick="$pick 10"
+  STEPS=" $pick "
+}
+has_step() { [[ "$STEPS" == *" $1 "* ]]; }
+
+cmd=${1:-setup}
+case "$cmd" in
+  setup)
+    echo "Настройка доставки Ozon для Tilda"
+    echo "Enter — оставить значение в скобках."
+    shift || true
+    pick_steps "$@"
+    # Шаги 1 и 5 — здесь (пишут .env и перезапускают сервис), остальные — в контейнере.
+    before=""; after=""
+    for n in 2 3 4; do has_step "$n" && before="$before,$n"; done
+    for n in 6 7 8 9 10; do has_step "$n" && after="$after,$n"; done
+    has_step 1 && step_domain
+    [ -n "$before" ] && app_cli setup --steps "${before#,}" $PARTIAL
+    has_step 5 && step_keys
+    [ -n "$after" ] && app_cli setup --steps "${after#,}" $PARTIAL
+    true
+    ;;
+  summary) app_cli summary ;;
+  show|check|logs) app_cli "$@" ;;
+  restart)
+    docker compose up -d >/dev/null
+    [ -n "$(envget DOMAIN)" ] && [[ "$(envget PUBLIC_URL)" == https://* ]] && docker compose --profile https up -d >/dev/null
+    wait_health && echo "✓ Сервис работает"
+    ;;
+  update)
+    if ! git remote get-url origin >/dev/null 2>&1; then
+      echo "✕ Код поставлен не через git clone — обновлять нечем. Скачайте новую версию в $DIR и запустите:"
+      echo "    sudo bash $DIR/deploy/install.sh"
+      exit 1
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+      echo "✕ В коде есть свои правки — обновление их не тронет и остановится. Что изменено:"
+      git status --short
+      echo "  Сохраните правки (git commit) или отмените (git checkout -- <файл>) и запустите ещё раз."
+      exit 1
+    fi
+    before=$(git rev-parse --short HEAD)
+    echo "→ Скачиваю новую версию"
+    git pull -q --ff-only || { echo "✕ Не получилось обновить: git pull --ff-only. Покажите это разработчику."; exit 1; }
+    after=$(git rev-parse --short HEAD)
+    if [ "$before" = "$after" ]; then echo "✓ Уже последняя версия ($after)"; exit 0; fi
+    git log --format='  • %s' "$before..$after" | head -20
+    bash "$DIR/deploy/install.sh"
+    ;;
+  *)
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

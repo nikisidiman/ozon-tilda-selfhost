@@ -1,0 +1,48 @@
+# Сервис на сервере магазина: приложение, база и Caddy (HTTPS).
+# Значения — в .env рядом; его пишут deploy/install.sh и команда ozon-tilda.
+services:
+  app:
+    container_name: ozon-tilda-app
+    image: ozon-tilda-app:latest
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://ozon:${POSTGRES_PASSWORD}@ozon-tilda-db:5432/ozon_tilda
+    depends_on:
+      db:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  db:
+    container_name: ozon-tilda-db
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ozon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ozon_tilda
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ozon -d ozon_tilda"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Запускается, когда у сервера есть адрес (DOMAIN в .env) — ozon-tilda setup, шаг 1.
+  caddy:
+    container_name: ozon-tilda-caddy
+    image: caddy:2
+    restart: unless-stopped
+    profiles: [https]
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/data:/data
+      - ./caddy/config:/config
+    depends_on: [app]

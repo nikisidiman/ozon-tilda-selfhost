@@ -1,0 +1,5 @@
+# HTTPS для адреса сервера (DOMAIN в .env). Сертификат Let's Encrypt Caddy получает и продлевает сам.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy ozon-tilda-app:3000
+}
